@@ -1,0 +1,332 @@
+---
+title: "Analiza danych dotyczących gospodarki"
+author: "Piotr Wojtyniak"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+# Streszczenie
+W raporcie dokonano analizy czterech zbiorów danych. Pierwszy z nich zawiera 213 wskaźników opisujących rozwój gospodarczy poszczególnych krajów i całego świata w latach 1970-2020, przy czym analizie poddano jedynie dane dotyczące rozwoju ogólnoświatowego. Pozostałe zbiory zawierają kolejno ceny złota, kursy wymiany walut i miesięczne wyniki S&P Composite. Celem analizy było zbadanie, które zmienne są skorelowane z cenami złota i zbudowanie na ich podstawie regresora dokonującego predykcji cen złota.
+
+Ze wskaźników rozwoju gospodarczego najwyższą wartość współczynnika korelacji Pearsona z cenami złota osiągnęła emisja gazów cieplarnianych, w przypadku kursów wymiany walut był to kurs dolara brunejskiego, a ze zbioru S&P Composite dywidenda. Cena złota w kolejnych latach wykazywała tendencję wzrostową, więc najbardziej skorelowane z nią były te zmienne, które również wykazywały monotoniczność względem czasu. Kurs dolara brunejskiego malał z czasem, natomiast pozostałe z wymienionych zmiennych rosły.
+
+Do wytrenowania regresora wykorzystano ceny złota wraz ze zmiennymi, dla których wartość bezwzględna współczynnika korelacji z nimi wyniosła co najmniej 0,85. Użyto w tym celu algorytmu Random Forest. Wytrenowano go na zbiorze treningowym z wykorzystaniem 3-krotnej walidacji krzyżowej powtórzonej 5 razy. Następnie przetestowano na zbiorze testowym, osiągając następujące wartości miar:
+
+- RMSE = 14.9532186
+
+- Rsquared = 0.9990274
+
+- MAE = 8.9470331
+
+Po dokonaniu analizy ważności atrybutów okazało się, że największy wpływ na predykcję ceny złota miały następujące zmienne:
+
+- Kurs chińskiego Yuana
+
+- Wydatki krajowe brutto
+
+- Emisja gazów cieplarnianych
+
+- Produkcja energii elektrycznej ze źródeł odnawialnych z wyłączeniem hydroelektrowni
+
+# Załadowanie potrzebnych bibliotek
+```{r wczytywanieBibliotek, message=FALSE, warning=FALSE}
+library(dplyr)
+library(tidyr)
+library(readxl)
+library(corrplot)
+library(caret)
+library(zoo)
+library(plotly)
+```
+
+# Wczytanie i wstępne przetworzenie danych
+### World Development Indicators
+Dane dotyczące statystyk rozwoju gospodarczego poszczególnych krajów wczytano za pomocą poniższego kodu.
+```{r wczytanieDanych_WDI}
+world_dev_ind <- read_excel("Data pack/World_Development_Indicators.xlsx", sheet = "Data", na = "..")
+head(world_dev_ind)
+```
+Do analizy użyto jedynie wskaźników opisujących rozwój całego świata bez podziału na kraje (dane z wartością "World" kolumny "Country Name"), ponieważ prawdopodobnie rozwój ogólnoświatowy ma większy wpływ na ceny złota niż rozwój pojedynczego kraju. Dane przetworzono do postaci, w której każdy wiersz zawiera rok i wartości poszczególnych wskaźników w osobnych kolumnach. Nazwy kolumn pochodzą z kolumny "Series Code" oryginalnego zbioru. Taki format danych jest przydatny do obliczania korelacji między poszczególnymi zmiennymi. Zbiór ograniczono jedynie do tych kolumn, które są wypełnione danymi przynajmniej w 70%. Listę tych kolumn zawiera zmienna filled_series w poniższym kodzie. Wartości z mniej wypełnionych kolumn mogłyby być niereprezentatywne w przypadku szukania korelacji.
+```{r preprocessing_WDI}
+world_dev_ind <- world_dev_ind %>% 
+  filter(`Country Name` == "World") %>%
+  select(-c("Country Name", "Country Code")) %>%
+  gather("Year", "Value", -c("Series Name", "Series Code")) %>%
+  mutate(Year = substr(Year, 1, 4), `Series Name` = gsub("\\$", " dollar", `Series Name`))
+
+filled_series <- world_dev_ind %>%
+  group_by(`Series Code`) %>%
+  summarise(not_na_values = sum(!is.na(Value))) %>%
+  filter(not_na_values > 35) %>%
+  select(`Series Code`)
+
+world_dev_ind_spread <- world_dev_ind %>%
+  filter(`Series Code` %in% filled_series$`Series Code`) %>%
+  select(-c("Series Name")) %>%
+  spread("Series Code", "Value")
+head(world_dev_ind_spread)
+```
+### Gold Prices
+Ze zbioru dotyczącego cen złota wczytano datę, miesiąc i rok pomiaru w celu powiązania tych danych z danymi z innych zbiorów, które mierzone są z różną ziarnistością. Z kolumn zawierających wartości złota wybrano tą przechowującą ceny w dolarach mierzone przed południem.
+```{r wczytanieDanych_gold_prices}
+gold_prices <- read.csv("Data pack/Gold prices.csv")
+gold_prices$Date <- as.Date(gold_prices$Date)
+
+gold_prices <- gold_prices %>%
+  mutate(Year = format(Date, format="%Y"),
+         Month = format(Date, format="%Y-%m"),
+         Price_USD_AM = `USD..AM.`) %>%
+  select(Date, Year, Month, Price_USD_AM)
+head(gold_prices)
+```
+### Currency Exchange Rates
+Poniższy kod odpowiada za wczytanie zbioru przechowującego kursy wymiany walut. Podobnie jak w przypadku World Development Indicators zachowano tylko kolumny wypełnione w przynajmniej 70%.
+```{r wczytanieDanych_currency_ex_rates}
+curr_ex_rates <- read.csv("Data pack/CurrencyExchangeRates.csv")
+curr_ex_rates$Date <- as.Date(curr_ex_rates$Date)
+
+filled_curr_columns <- curr_ex_rates %>%
+  gather("Currency", "Rate", -c("Date")) %>%
+  group_by(`Currency`) %>%
+  summarise(not_na_values = sum(!is.na(Rate))) %>%
+  filter(not_na_values > 4184) %>%
+  select(`Currency`)
+
+curr_ex_rates <- curr_ex_rates %>%
+  select(Date, as.vector(filled_curr_columns$Currency))
+```
+### S&P Composite
+Poniższy kod odpowiada za wczytanie zbioru S&P Composite. Zawiera on dane od roku 1871, jednak ograniczono go do wartości od 1968 roku, ponieważ będą one wykorzystywane do szukania relacji z cenami złota, które są dostępne właśnie od roku 1968. Wartości te są mierzone raz w miesiącu, więc z daty zachowano tylko miesiąc. Wywołanie funkcji summary pokazuje, że kolumny tego zbioru są prawie całkowicie wypełnione wartościami.
+```{r wczytanieDanych_sp_composite}
+sp_composite <- read.csv("Data pack/S&P Composite.csv")
+sp_composite$Year <- as.Date(sp_composite$Year)
+sp_composite <- sp_composite %>%
+  filter(Year >= as.Date("1968-01-01")) %>%
+  mutate(Month = format(Year, format="%Y-%m")) %>%
+  select(-"Year")
+summary(sp_composite)
+head(sp_composite)
+```
+
+# Podsumowanie zbioru danych
+Poniżej przedstawiono podstawowe statystyki atrybutów i rozmiary wstępnie przetworzonych zbiorów danych.
+
+### World Development Indicators
+```{r podstawoweStatystyki_WDI, results='asis', echo=FALSE}
+cat(paste("Liczba wierszy:", nrow(world_dev_ind_spread)))
+cat("\n\n")
+cat(paste("Liczba kolumn:", ncol(world_dev_ind_spread)))
+cat("\n\n")
+```
+
+### Gold Prices
+```{r podstawoweStatystyki_gold_prices, results='asis', echo=FALSE}
+cat(paste("Liczba wierszy:", nrow(gold_prices)))
+cat("\n\n")
+cat(paste("Liczba kolumn:", ncol(gold_prices)))
+options(knitr.kable.NA = '')
+print(knitr::kable(summary(gold_prices)))
+```
+
+### Currency Exchange Rates
+```{r podstawoweStatystyki_currency_ex_rates, results='asis', echo=FALSE}
+cat(paste("Liczba wierszy:", nrow(curr_ex_rates)))
+cat("\n\n")
+cat(paste("Liczba kolumn:", ncol(curr_ex_rates)))
+print(knitr::kable(summary(curr_ex_rates[, 1:8])))
+print(knitr::kable(summary(curr_ex_rates[, 9:16])))
+print(knitr::kable(summary(curr_ex_rates[, 17:24])))
+print(knitr::kable(summary(curr_ex_rates[, 25:32])))
+print(knitr::kable(summary(curr_ex_rates[, 33:40])))
+```
+### S&P Composite
+```{r podstawoweStatystyki_sp_composite, results='asis', echo=FALSE}
+cat(paste("Liczba wierszy:", nrow(sp_composite)))
+cat("\n\n")
+cat(paste("Liczba kolumn:", ncol(sp_composite)))
+print(knitr::kable(summary(sp_composite[, 1:5])))
+print(knitr::kable(summary(sp_composite[, 6:10])))
+```
+
+# Korelacje między zmiennymi
+W sekcji tej zbadano korelacje między cenami złota a pozostałymi zmiennymi. Celem tych operacji było znalezienie zmiennych najbardziej powiązanych z cenami złota, w celu wykorzystania ich do przewidywania jego wartości.
+
+### Korelacje między Gold Prices a World Development Indicators
+Aby znaleźć najbardziej skorelowane z cenami złota wskaźniki światowego rozwoju najpierw do ceny złota dołączono informację o wartości wskaźników w danym roku. Następnie obliczono współczynnik korelacji Pearsona między wszystkimi parami zmiennych, wykorzystując do obliczeń jedynie niepuste pary wartości zmiennych. Do dalszej analizy wykorzystane zostaną wskaźniki o współczynniku korelacji z cenami złota większym niż 0,85. Poniżej pokazano kody i nazwy tych zmiennych wraz z wartością współczynnika korelacji.
+```{r korelacje_gold_wdi, results='asis'}
+gold_and_wdi <- world_dev_ind_spread %>% full_join(gold_prices, by = "Year")
+
+corr_gold_wdi <- gold_and_wdi %>% select(-c("Year", "Date", "Month")) %>% cor(use="pairwise.complete.obs")
+corr_gold_wdi_list <- corr_gold_wdi["Price_USD_AM", ]
+corr_gold_wdi_list <- corr_gold_wdi_list[names(corr_gold_wdi_list) %in% "Price_USD_AM" == FALSE]
+gold_wdi_most_correlated <- names(corr_gold_wdi_list[abs(corr_gold_wdi_list) > 0.85])
+print(knitr::kable(
+  world_dev_ind %>%
+    select("Series Name", "Series Code") %>%
+    filter(`Series Code` %in% gold_wdi_most_correlated) %>%
+    distinct() %>%
+    mutate(Corr=corr_gold_wdi_list[`Series Code`]) %>%
+    arrange(desc(abs(Corr)))))
+```
+Korelacje z pozostałymi zmiennymi zbadano w analogiczny sposób.
+
+### Korelacje między Gold Prices a Currency Exchange Rates
+Poniższe wykresy prezentują korelacje wartości złota z kursami wymiany poszczególnych walut. W tabeli pokazano kursy o największej wartości bezwzględnej współczynnika korelacji.
+```{r korelacje_gold_curr_ex_rates, fig.width = 12, warning=FALSE, results='asis'}
+gold_and_curr <- curr_ex_rates %>% full_join(gold_prices, by = "Date")
+
+corr_gold_curr <- gold_and_curr %>% select(-c("Year", "Date", "Month")) %>% cor(use="pairwise.complete.obs")
+corr_gold_curr_list <- corr_gold_curr["Price_USD_AM", ]
+corr_gold_curr_list <- corr_gold_curr_list[names(corr_gold_curr_list) %in% "Price_USD_AM" == FALSE]
+gold_curr_most_correlated <- names(corr_gold_curr_list[abs(corr_gold_curr_list) > 0.85 & !is.na(corr_gold_curr_list)])
+
+for(i in c(1, 21)) {
+  corrplot(corr_gold_curr["Price_USD_AM", i:(i+19), drop = FALSE], method="square", addCoef.col = 'black',
+         cl.pos = 'n', col = COL2('PiYG'))
+}
+print(knitr::kable(data.frame(Variable=gold_curr_most_correlated, Corr=as.vector(corr_gold_curr_list[gold_curr_most_correlated]))))
+```
+
+### Korelacje między Gold Prices a S&P Composite
+Poniższa tabela przedstawia najbardziej skorelowane z cenami złota zmienne ze zbioru S&P Composite.
+```{r korelacje_gold_sp_composite, results='asis'}
+gold_and_sp <- sp_composite %>% full_join(gold_prices, by = "Month")
+
+corr_gold_sp <- gold_and_sp %>% select(-c("Year", "Date", "Month")) %>% cor(use="pairwise.complete.obs")
+corr_gold_sp_list <- corr_gold_sp["Price_USD_AM", ]
+corr_gold_sp_list <- corr_gold_sp_list[names(corr_gold_sp_list) %in% "Price_USD_AM" == FALSE]
+gold_sp_most_correlated <- names(corr_gold_sp_list[abs(corr_gold_sp_list) > 0.85])
+print(knitr::kable(data.frame(Variable=gold_sp_most_correlated, Corr=as.vector(corr_gold_sp_list[gold_sp_most_correlated]))))
+```
+
+# Analiza wartości wybranych atrybutów
+### Cena złota
+```{r analizaAtrybutow_gold_price, results='asis'}
+print(knitr::kable(summary(gold_prices[, "Price_USD_AM", drop=FALSE])))
+p <- ggplot(gold_prices, aes(Date, Price_USD_AM)) + 
+  ggtitle("Gold Price") +
+    geom_line()
+ggplotly(p)
+```
+Powyższy wykres pokazuje wzrost ceny złota od około 30 dolarów w roku 1968 do wartości w okolicach 2000 dolarów w roku 2020. Najbardziej znaczący wzrost tej ceny widać w latach 2001-2011, w których wzrosła ona z 250 do 1900 dolarów. Wartość maksymalną 2061,50 dolarów osiągnęła 07.08.2020 po czym rozpoczęła się tendencja spadkowa.
+
+### Całkowita emisja gazów cieplarnianych na świecie
+```{r analizaAtrybutow_greenhouse_gas_emissions, results='asis'}
+print(knitr::kable(summary(world_dev_ind_spread[, "EN.ATM.GHGT.KT.CE", drop=FALSE])))
+p <- ggplot(world_dev_ind_spread %>% mutate(Year=strtoi(Year)), aes(Year, EN.ATM.GHGT.KT.CE)) + 
+  ggtitle("Total greenhouse gas emissions (World)") +
+  ylab("Gas emission [kt of CO2 equivalent]") + 
+    geom_line()
+ggplotly(p)
+```
+Spośród wskaźników światowego rozwoju najwyższą wartość korelacji z cenami złota osiągneła całkowita emisja gazów cieplarnianych. Na powyższym wykresie podobnie jak w przypadku cen złota widać tendencję wzrostową tej wartości w ostatnich latach. Jedyny znaczący jej spadek miał miejsce między rokiem 1989 a 1990.
+
+
+### Kurs dolara brunejskiego
+```{r analizaAtrybutow_brunei_dollar, results='asis'}
+print(knitr::kable(summary(curr_ex_rates[, "Brunei.Dollar", drop=FALSE])))
+p <- ggplot(curr_ex_rates, aes(Date, Brunei.Dollar)) + 
+  ggtitle("Brunei Dollar's Exchange Rate") +
+  ylab("Exchange Rate") + 
+  xlim(as.Date("1968-01-01"), as.Date("2021-12-31")) + 
+    geom_line()
+ggplotly(p)
+```
+Wartość współczynnika korelacji między kursem dolara brunejskiego a ceną złota wyniosła -0.96. Tą silną ujemną korelację potwierdza powyższy wykres, na którym widać tendencję spadkową kursu tej waluty w ostatnich latach, czyli przeciwną niż w przypadku cen złota. Ostatnie większe wzrosty tej wartości miały miejsce między rokiem 2008 a 2009 i między 2014 a 2016. Swoją maksymalną wartość 1,851 osiągnęła ona 31.12.2001. Natomiast wartość minimalną równą 1 osiągnęła 02.09.1998, jednak jak pokazuje wykres jest to wartość odstająca, więc prawdopodobnie jest niepoprawna. Wartość minimalną pasującą do trendu pokazywanego przez wykres widać 27.07.2011 i wynosi ona 1,2.
+
+Poniższy wykres przedstawia zależność ceny złota od kursu dolara brunejskiego, która potwierdza ujemną korelację między tymi zmiennymi.
+```{r analizaAtrybutow_gold_brunei_dollar}
+p <- ggplot(gold_and_curr, aes(Brunei.Dollar, Price_USD_AM)) + 
+  ggtitle("Dependency between Gold Price and Brunei Dollar Exchange Rate") +
+  ylab("Gold Price") +
+  xlab("Brunei Dollar Exchange Rate") + 
+    geom_point()
+ggplotly(p)
+```
+
+### Dywidenda
+```{r analizaAtrybutow_dividend, results='asis'}
+print(knitr::kable(summary(sp_composite[, "Dividend", drop=FALSE])))
+p <- ggplot(sp_composite %>% mutate(Month = as.Date(paste(Month, "-01", sep=""))), aes(Month, Dividend)) + 
+  ggtitle("Dividend") +
+  xlim(as.Date("1968-01-01"), as.Date("2021-12-31")) + 
+    geom_line()
+ggplotly(p)
+```
+Najwyższą korelację z cenami złota ze zbioru S&P Composite wykazuje dywidenda, której wartości w ostatnich latach wykazują wyraźną tendencję wzrostową od wartości 2,93 do 59,68.
+
+# Przewidywanie cen złota
+W sekcji tej stworzono regresor przewidujący ceny złota na podstawie zmiennych, których wartość bezwzględna współczynnika korelacji wyniosła co najmniej 0,85.
+
+### Przygotowanie zbioru danych
+Ze zbiorów danych wybrano najbardziej skorelowane zmienne, które połączono razem z cenami złota w jeden zbiór w zmiennej dataset. Aby wśród przypadków treningowych i testowych nie było krotek, w których brakuje wartości którejś zmiennej, krótsze przerwy w danych (do 5 wartości NA pod rząd) wypełniono za pomocą interpolacji liniowej, natomiast wiersze które po tym zabiegu nadal zawierały wartości puste usunięto.
+```{r regression_dataset, message=FALSE}
+wdi_correlated <- world_dev_ind_spread %>% select(Year, gold_wdi_most_correlated)
+curr_correlated <- curr_ex_rates %>% select(Date, gold_curr_most_correlated)
+sp_correlated <- sp_composite %>% select(Month, gold_sp_most_correlated)
+
+dataset <- gold_prices %>%
+  full_join(wdi_correlated, by="Year") %>%
+  full_join(curr_correlated, by="Date") %>%
+  full_join(sp_correlated, by="Month") %>%
+  arrange(Date) %>%
+  mutate(across(-c("Date", "Year", "Month"), ~ na.approx(.x, maxgap=5, rule=2))) %>%
+  drop_na() %>%
+  select(-c("Date", "Year", "Month"))
+```
+
+### Podział danych na zbiór testowy i treningowy
+Zbiór danych podzielono na zbiór testowy i treningowy w proporcjach 70%-30%. W procesie uczenia wykorzystana zostanie 3-krotna walidacja krzyżowa powtórzona 5 razy.
+```{r regression_partition}
+set.seed(12321)
+inTraining <- createDataPartition(dataset$Price_USD_AM, p=0.7, list=F)
+training <- dataset[ inTraining,]
+testing  <- dataset[-inTraining,]
+
+ctrl <- trainControl(
+  method = "repeatedcv",
+  number = 3,
+  repeats = 5)
+```
+
+### Trenowanie modelu
+Jako algorytm wybrano Random Forest.
+```{r regression_training}
+set.seed(12321)
+fit <- train(Price_USD_AM ~ .,
+             data = training,
+             method = "rf",
+             trControl = ctrl,
+             ntree = 10)
+fit
+```
+
+### Ocena predykcji
+Poniższy kod dokonuje oceny jakości predykcji na podstawie zbioru testowego.
+```{r regression_prediction}
+test_predictions <- predict(fit, newdata = testing)
+postResample(pred = test_predictions, obs = testing$Price_USD_AM)
+```
+Do oceny wykorzystano miary RMSE, Rsquared i MAE, ponieważ są to miary odpowiednie do oceny regresji. Patrząc na wartość RMSE można stwierdzić, że przewidywania ceny złota różniły się średnio o 14,95 od ceny rzeczywistej. Biorąc pod uwagę, że średnia wartość ceny złota wynosiła 575,20, jest to błąd około 2,6%. Jeśli natomiast błąd ten porównamy z medianą ceny złota (383,32) otrzymamy wartość 3,9%. Miara MAE jest około 1,7 razy niższa niż RMSE, co świadczy o występowaniu dużych wartości błędów, które zawyżają RMSE. Miara Rsquared przekraczająca 0,999 świadczy o wysokim stopniu dopasowania modelu do danych.
+
+### Analiza ważności atrybutów najlepszego znalezionego modelu
+```{r regression_variables}
+variable_importance <- varImp(fit)
+plot(variable_importance, main="Variable importance in the trained model")
+```
+
+Powyższy wykres pokazuje, że największy wpływ na predykcję ma kurs chińskiego yuana. Natomiast kurs dolara brunejskiego, analizowanego wcześniej jako kurs o największym współczynniku korelacji, znalazł się dopiero na 8 miejscu. Poniżej przedstawiono wykres zależności między kursem tej waluty a ceną złota, analogicznie jak wcześniej dla dolara brunejskiego. Porównując go z wykresem dla dolara widać, że dla danego kursu jest mniej odpowiadających mu cen złota szczególnie dla większych wartości kursu, co pozwala na trafniejsze predykcje.
+
+```{r analizaAtrybutow_chinese_yuan, results='asis'}
+p <- ggplot(gold_and_curr, aes(Chinese.Yuan, Price_USD_AM)) + 
+  ggtitle("Dependency between Gold Price and Chinese Yuan Exchange Rate") +
+  ylab("Gold Price") +
+  xlab("Chinese Yuan Exchange Rate") + 
+    geom_point()
+ggplotly(p)
+```
+
+Spośród wskaźników światowego rozwoju analizowana wcześniej emisja gazów cieplarnianych okazała się być trzecim najważniejszym atrybutem. Na drugim miejscu natomiast znalazły się wydatki krajowe brutto, a na czwartym produkcja energii elektrycznej ze źródeł odnawialnych z wyłączeniem hydroelektrowni.
